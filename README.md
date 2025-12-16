@@ -38,7 +38,6 @@ export NOX_SUBNET=10.8.0.0/24      # опционально, по умолчан
 sudo ./bin/nox-server
 ```
 
-Сервер поднимает TUN `nox0`, раздаёт адреса начиная с `10.8.0.2/24`, шлёт keepalive каждые 20 секунд и придерживает аренды (lease) даже при разрыве TCP‑сессии — адрес освобождается по таймауту неактивности (10 минут) или по явному CtrlReleaseIP.
 
 ### Запуск клиента
 
@@ -82,24 +81,7 @@ sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
 
 ## Протокол (MVP)
 
-### Frame
-* `TypeData` — зашифрованные IP-пакеты для TUN (`StreamID=100`).
-* `TypeControl` — служебные команды.
 
-### Control opcodes
-* `CtrlHello` (client→server): payload[1:9] = SessionID (8 bytes). На основе SessionID сервер выдаёт/переиспользует IP.
-* `CtrlAssignIP` (server→client): payload = `10.8.0.X/24` (ASCII).
-* `CtrlHeartbeat` (двусторонний keepalive).
-* `CtrlReleaseIP` (client→server): просьба освободить lease.
-
-### IPAM и сессии
-* Sticky IP по SessionID, переиспользуется при переподключении.
-* TTL 10 минут, GC каждые 5 минут, освобождение при любом завершении соединения.
-* Wrap-around без дыр; no free IP → соединение закрывается.
-
-### Transport
-* TCP, шифрование ChaCha20-Poly1305, общий ключ `NOX_KEY_HEX` (32 байта, hex 64).
-* Handshake rate-limit (по умолчанию 20 rps, burst 40) и лимит клиентов (`NOX_MAX_CLIENTS`, по умолчанию 256).
 
 ## Записка о стабильности
 

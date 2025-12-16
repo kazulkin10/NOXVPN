@@ -1,7 +1,7 @@
 package main
 
 import (
-	"crypto/rand"
+
 	"encoding/hex"
 	"log"
 	"net"
@@ -29,7 +29,6 @@ func main() {
 	staticCIDR := getenv("NOX_CLIENT_CIDR", "10.8.0.2/24")
 	tunName := getenv("NOX_TUN", "nox1")
 
-	loadSessionID()
 
 	keyHex := strings.TrimSpace(os.Getenv("NOX_KEY_HEX"))
 	if keyHex == "" {
@@ -73,17 +72,6 @@ func runOnce(server, staticCIDR, tunName string, ciph *noxcrypto.Cipher) error {
 
 	assigned := staticCIDR
 
-	// отправляем HELLO с SessionID
-	helloPayload := append([]byte{frame.CtrlHello}, sessionID[:]...)
-	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := frame.Encode(conn, &frame.Frame{
-		Type:     frame.TypeControl,
-		StreamID: 0,
-		Flags:    0,
-		Payload:  helloPayload,
-	}); err != nil {
-		return err
-	}
 
 	// ждём control AssignIP
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -180,16 +168,5 @@ func getenv(k, def string) string {
 		return def
 	}
 	return v
-}
-
-func loadSessionID() {
-	if v := strings.TrimSpace(os.Getenv("NOX_SESSION_ID")); len(v) == 16 {
-		if b, err := hex.DecodeString(v); err == nil {
-			copy(sessionID[:], b)
-			return
-		}
-	}
-	if _, err := rand.Read(sessionID[:]); err != nil {
-		log.Fatalf("session id gen: %v", err)
-	}
+n
 }
