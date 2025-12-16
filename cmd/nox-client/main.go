@@ -1,6 +1,7 @@
 package main
 
 import (
+
 	"encoding/hex"
 	"log"
 	"net"
@@ -21,10 +22,13 @@ const (
 	streamData uint32 = 100
 )
 
+var sessionID [8]byte
+
 func main() {
 	server := getenv("NOX_SERVER", "208.123.185.235:9000")
 	staticCIDR := getenv("NOX_CLIENT_CIDR", "10.8.0.2/24")
 	tunName := getenv("NOX_TUN", "nox1")
+
 
 	keyHex := strings.TrimSpace(os.Getenv("NOX_KEY_HEX"))
 	if keyHex == "" {
@@ -67,6 +71,7 @@ func runOnce(server, staticCIDR, tunName string, ciph *noxcrypto.Cipher) error {
 	log.Println("client TUN", tunName, "created")
 
 	assigned := staticCIDR
+
 
 	// ждём control AssignIP
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -163,4 +168,5 @@ func getenv(k, def string) string {
 		return def
 	}
 	return v
+n
 }

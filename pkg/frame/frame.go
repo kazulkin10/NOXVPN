@@ -20,6 +20,7 @@ const (
 	CtrlAssignIP  = 0x01
 	CtrlReleaseIP = 0x02
 	CtrlHeartbeat = 0x03
+
 )
 
 // Базовая структура кадра NOX (совместима с encode.go / decode.go)

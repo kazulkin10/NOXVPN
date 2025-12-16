@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+
 	"strings"
 	"sync"
 	"time"
@@ -111,6 +112,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 	}); err != nil {
 		log.Println("assign send:", err)
 
+
 	kaDone := make(chan struct{})
 	var kaOnce sync.Once
 	closeKA := func() { kaOnce.Do(func() { close(kaDone) }) }
@@ -130,7 +132,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 					Flags:    0,
 					Payload:  []byte{frame.CtrlHeartbeat},
 				})
-
+in
 			case <-kaDone:
 				return
 			}
@@ -163,7 +165,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 				continue
 			}
 
-n
+
 
 			if fr.StreamID == streamData {
 				if _, err := t.WritePacket(pt); err != nil {
@@ -202,4 +204,5 @@ func getenv(k, def string) string {
 		return def
 	}
 	return v
+
 }

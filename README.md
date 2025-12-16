@@ -39,7 +39,6 @@ sudo ./bin/nox-server
 ```
 
 
-
 ### Запуск клиента
 
 ```bash
@@ -82,11 +81,6 @@ sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
 
 ## Протокол (MVP)
 
-* Кадры имеют типы `TypeData` и `TypeControl`. Контрольные кадры несут команды:
-  * `CtrlAssignIP` — сервер выдаёт CIDR, например `10.8.0.2/24`.
-  * `CtrlHeartbeat` — keepalive в обе стороны.
-  * `CtrlReleaseIP` — запрос на освобождение аренды.
-* Данные в потоке `StreamID=100` — сырые IP-пакеты TUN, зашифрованные ChaCha20-Poly1305 (nonce = счётчик).
 
 
 ## Записка о стабильности
