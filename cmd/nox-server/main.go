@@ -22,7 +22,7 @@ import (
 const (
 	streamData  uint32 = 100
 	defaultCIDR        = "10.8.0.0/24"
-	leaseTTL           = 10 * time.Minute
+
 )
 
 func main() {
@@ -61,9 +61,7 @@ func main() {
 		tk := time.NewTicker(5 * time.Minute)
 		defer tk.Stop()
 		for range tk.C {
-			if killed := allocator.ReapIdle(leaseTTL); killed > 0 {
-				log.Printf("ipam: reaped %d idle lease(s)\n", killed)
-			}
+
 		}
 	}()
 
@@ -95,24 +93,12 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 
 	ra := conn.RemoteAddr().String()
 	clientID := strings.Split(ra, ":")[0]
-	sessionID := sessionIDForClient(clientID)
-	sessionKey := hex.EncodeToString(sessionID[:])
+
 	log.Println("client connected from", ra)
 
 	_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
 
-	lease, isNew, err := allocator.Acquire(sessionKey)
-	if err != nil {
-		total, used := allocator.Stats()
-		log.Printf("ipam: %v (used %d/%d)\n", err, used, total)
-		return
-	}
-	leaseCIDR := fmt.Sprintf("%s/%d", lease.IP.String(), lease.MaskBits)
-	if isNew {
-		log.Printf("ipam: lease %s for %s (new)\n", leaseCIDR, sessionKey)
-	} else {
-		log.Printf("ipam: lease %s for %s (reused)\n", leaseCIDR, sessionKey)
-	}
+
 
 	assignPayload := []byte{frame.CtrlAssignIP}
 	assignPayload = append(assignPayload, []byte(leaseCIDR)...)
@@ -124,7 +110,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 		Payload:  assignPayload,
 	}); err != nil {
 		log.Println("assign send:", err)
-		allocator.Release(sessionKey)
+
 		return
 	}
 
@@ -132,6 +118,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 	var kaOnce sync.Once
 	closeKA := func() { kaOnce.Do(func() { close(kaDone) }) }
 	defer closeKA()
+
 
 	go func() {
 		tk := time.NewTicker(20 * time.Second)
@@ -146,7 +133,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 					Flags:    0,
 					Payload:  []byte{frame.CtrlHeartbeat},
 				})
-				allocator.Touch(sessionKey)
+
 			case <-kaDone:
 				return
 			}
@@ -167,9 +154,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 				if len(fr.Payload) > 0 {
 					switch fr.Payload[0] {
 					case frame.CtrlReleaseIP:
-						allocator.Release(sessionKey)
-					case frame.CtrlHeartbeat:
-						allocator.Touch(sessionKey)
+
 					}
 				}
 				continue
@@ -181,7 +166,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 				continue
 			}
 
-			allocator.Touch(sessionKey)
+
 
 			if fr.StreamID == streamData {
 				if _, err := t.WritePacket(pt); err != nil {
