@@ -1,0 +1,193 @@
+package main
+
+import (
+"log"
+"net"
+"os"
+"strings"
+"time"
+	"encoding/hex"
+	"sync"
+
+noxcrypto "nox-core/pkg/crypto"
+"nox-core/pkg/frame"
+"nox-core/pkg/tun"
+ipam "nox-core/internal/server"
+)
+
+const (
+streamData uint32 = 100
+)
+
+func main() {
+addr := getenv("NOX_LISTEN", ":9000")
+keyHex := os.Getenv("NOX_KEY_HEX")
+
+var ciph *noxcrypto.Cipher
+// ВАРВАРСКИ: если ключ не задан — генерим и печатаем (потом заменишь на стабильный конфиг)
+if keyHex == "" {
+k, err := noxcrypto.NewRandomKey()
+if err != nil { log.Fatal(err) }
+// сырой вывод, чтобы ты руками перенёс в env на обеих сторонах
+log.Printf("NOX_KEY (raw bytes len=%d). Set NOX_KEY_HEX later!", len(k))
+ciph, err = noxcrypto.NewCipherFromKey(k)
+if err != nil { log.Fatal(err) }
+} else {
+// если хочешь hex — добавишь потом; сейчас не тормозим разработку.
+log.Println("NOX_KEY_HEX parsing not implemented in big-bang patch; unset it for now.")
+k, err := noxcrypto.NewRandomKey()
+if err != nil { log.Fatal(err) }
+ciph, err = noxcrypto.NewCipherFromKey(k)
+if err != nil { log.Fatal(err) }
+}
+
+t, err := tun.Create("nox0")
+if err != nil {
+log.Fatal(err)
+}
+log.Println("TUN nox0 created")
+
+ipam := ipam.NewIPAM()
+go func() {
+tk := time.NewTicker(5 * time.Minute)
+defer tk.Stop()
+for range tk.C {
+ipam.GC()
+}
+}()
+
+ln, err := net.Listen("tcp", addr)
+if err != nil {
+log.Fatal(err)
+}
+log.Println("NOX server listening on", addr)
+
+for {
+conn, err := ln.Accept()
+if err != nil {
+log.Println("accept:", err)
+continue
+}
+go handle(conn, t, ciph, ipam)
+}
+}
+
+func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, ipam *ipam.IPAM) {
+defer conn.Close()
+
+ra := conn.RemoteAddr().String()
+clientID := strings.Split(ra, ":")[0]
+log.Println("client connected from", ra)
+
+_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
+
+// Assign IP (control)
+lease, err := ipam.Allocate(clientID)
+if err != nil {
+log.Println("ipam:", err)
+return
+}
+assignPayload := []byte{frame.CtrlAssignIP}
+assignPayload = append(assignPayload, []byte(lease.CIDR)...)
+
+if err := frame.Encode(conn, &frame.Frame{
+Type:   frame.TypeControl,
+Stream: 0,
+Flags:  0,
+Payload: assignPayload,
+}); err != nil {
+log.Println("assign send:", err)
+ipam.Release(clientID)
+return
+}
+
+// keepalive sender
+kaDone := make(chan struct{})
+	var kaOnce sync.Once
+	closeKA := func(){ kaOnce.Do(func(){ closeKA() }) }
+
+	var kaOnce sync.Once
+	closeKA := func(){ kaOnce.Do(func(){ closeKA() }) }
+
+go func() {
+tk := time.NewTicker(20 * time.Second)
+defer tk.Stop()
+for {
+select {
+case <-tk.C:
+_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+_ = frame.Encode(conn, &frame.Frame{
+Type: frame.TypeControl, Stream: 0, Flags: 0,
+Payload: []byte{frame.CtrlHeartbeat},
+})
+case <-kaDone:
+return
+}
+}
+}()
+
+// conn -> tun
+go func() {
+for {
+_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+fr, err := frame.Read(conn)
+if err != nil {
+log.Println("read frame:", err)
+closeKA()
+ipam.Release(clientID)
+return
+}
+
+if fr.Type == frame.TypeControl {
+if len(fr.Payload) > 0 && fr.Payload[0] == frame.CtrlReleaseIP {
+ipam.Release(clientID)
+}
+continue
+}
+
+pt, err := ciph.Open(fr.Payload)
+if err != nil {
+log.Println("decrypt:", err)
+continue
+}
+
+if fr.Stream == streamData {
+if _, err := t.WritePacket(pt); err != nil {
+log.Println("tun write:", err)
+continue
+}
+}
+}
+}()
+
+// tun -> conn
+buf := make([]byte, 65535)
+for {
+n, err := t.ReadPacket(buf)
+if err != nil {
+log.Println("tun read:", err)
+closeKA()
+ipam.Release(clientID)
+return
+}
+enc := ciph.Seal(buf[:n])
+
+_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+if err := frame.Encode(conn, &frame.Frame{
+Type: frame.TypeData, Stream: streamData, Flags: 0, Payload: enc,
+}); err != nil {
+log.Println("conn write:", err)
+closeKA()
+ipam.Release(clientID)
+return
+}
+}
+}
+
+func getenv(k, def string) string {
+v := os.Getenv(k)
+if v == "" {
+return def
+}
+return v
+}
