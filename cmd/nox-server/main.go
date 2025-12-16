@@ -15,6 +15,14 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 
 	"nox-core/internal/server"
+
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
+
+
 	ipam "nox-core/internal/server"
 	noxcrypto "nox-core/pkg/crypto"
 	"nox-core/pkg/frame"
@@ -31,6 +39,7 @@ const (
 	defaultHandshakeRPS   = 20
 	defaultHandshakeBurst = 40
 	defaultMaxClients     = 256
+
 )
 
 func main() {
@@ -39,6 +48,7 @@ func main() {
 	handshakeRPS := getenvInt("NOX_HANDSHAKE_RPS", defaultHandshakeRPS)
 	handshakeBurst := getenvInt("NOX_HANDSHAKE_BURST", defaultHandshakeBurst)
 	maxClients := getenvInt("NOX_MAX_CLIENTS", defaultMaxClients)
+
 
 	keyHex := strings.TrimSpace(os.Getenv("NOX_KEY_HEX"))
 	if keyHex == "" {
@@ -167,6 +177,24 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 	// release lease on any exit path unless explicitly released earlier
 	defer allocator.Release(sessionKey)
 
+
+	assignPayload := []byte{frame.CtrlAssignIP}
+	assignPayload = append(assignPayload, []byte(leaseCIDR)...)
+
+	if err := frame.Encode(conn, &frame.Frame{
+		Type:     frame.TypeControl,
+		StreamID: 0,
+		Flags:    0,
+		Payload:  assignPayload,
+	}); err != nil {
+		log.Println("assign send:", err)
+		allocator.Release(sessionKey)
+		return
+	}
+
+	// release lease on any exit path unless explicitly released earlier
+	defer allocator.Release(sessionKey)
+
 	kaDone := make(chan struct{})
 	var kaOnce sync.Once
 	closeKA := func() { kaOnce.Do(func() { close(kaDone) }) }
@@ -247,6 +275,10 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+	buf := make([]byte, 65535)
+	for {
+		n, err := t.ReadPacket(buf)
+		if err != nil {
 			log.Println("tun read:", err)
 			return
 		}
@@ -283,4 +315,5 @@ func getenvInt(k string, def int) int {
 		return def
 	}
 	return n
+
 }
