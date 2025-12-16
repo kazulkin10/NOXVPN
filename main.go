@@ -22,6 +22,7 @@ import (
 const (
 	streamData  uint32 = 100
 	defaultCIDR        = "10.8.0.0/24"
+
 )
 
 func main() {
@@ -60,7 +61,7 @@ func main() {
 		tk := time.NewTicker(5 * time.Minute)
 		defer tk.Stop()
 		for range tk.C {
-			allocator.ReapIdle(10 * time.Minute)
+
 		}
 	}()
 
@@ -92,17 +93,12 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 
 	ra := conn.RemoteAddr().String()
 	clientID := strings.Split(ra, ":")[0]
-	session := sessionIDForClient(clientID)
+
 	log.Println("client connected from", ra)
 
 	_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
 
-	ip, mask, ok := allocator.Acquire(session)
-	if !ok {
-		log.Println("ipam: no available addresses")
-		return
-	}
-	leaseCIDR := fmt.Sprintf("%s/%d", ip.String(), mask)
+
 
 	assignPayload := []byte{frame.CtrlAssignIP}
 	assignPayload = append(assignPayload, []byte(leaseCIDR)...)
@@ -114,7 +110,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 		Payload:  assignPayload,
 	}); err != nil {
 		log.Println("assign send:", err)
-		allocator.Release(session)
+
 		return
 	}
 
@@ -122,7 +118,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 	var kaOnce sync.Once
 	closeKA := func() { kaOnce.Do(func() { close(kaDone) }) }
 	defer closeKA()
-	defer allocator.Release(session)
+
 
 	go func() {
 		tk := time.NewTicker(20 * time.Second)
@@ -137,6 +133,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 					Flags:    0,
 					Payload:  []byte{frame.CtrlHeartbeat},
 				})
+
 			case <-kaDone:
 				return
 			}
@@ -157,9 +154,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 				if len(fr.Payload) > 0 {
 					switch fr.Payload[0] {
 					case frame.CtrlReleaseIP:
-						allocator.Release(session)
-					case frame.CtrlHeartbeat:
-						allocator.Touch(session)
+n
 					}
 				}
 				continue
@@ -171,7 +166,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 				continue
 			}
 
-			allocator.Touch(session)
+
 
 			if fr.StreamID == streamData {
 				if _, err := t.WritePacket(pt); err != nil {

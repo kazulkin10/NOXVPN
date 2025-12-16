@@ -38,7 +38,7 @@ export NOX_SUBNET=10.8.0.0/24      # опционально, по умолчан
 sudo ./bin/nox-server
 ```
 
-Сервер поднимает TUN `nox0`, раздаёт адреса начиная с `10.8.0.2/24` и шлёт keepalive каждые 20 секунд.
+
 
 ### Запуск клиента
 
@@ -87,6 +87,7 @@ sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
   * `CtrlHeartbeat` — keepalive в обе стороны.
   * `CtrlReleaseIP` — запрос на освобождение аренды.
 * Данные в потоке `StreamID=100` — сырые IP-пакеты TUN, зашифрованные ChaCha20-Poly1305 (nonce = счётчик).
+
 
 ## Записка о стабильности
 
