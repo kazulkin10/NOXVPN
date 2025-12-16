@@ -105,3 +105,38 @@ sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
 
 * Сборка и тесты: `go test ./...` и `go build ./...` должны проходить перед деплоем.
 * Сервер и клиент завершают keepalive-горутину без паники `close of closed channel` благодаря `sync.Once`.
+
+## Быстрая проверка «с нуля»
+
+На всякий случай удаляем старые процессы и TUN-интерфейсы, потом собираем и запускаем.
+
+```bash
+# сервер
+cd /opt/nox
+sudo pkill -f nox-server 2>/dev/null
+sudo ip link del nox0 2>/dev/null
+go build -o bin/nox-server ./cmd/nox-server
+sudo env \
+  NOX_KEY_HEX="<64hex>" \
+  NOX_LISTEN=":9000" \
+  NOX_SUBNET="10.8.0.0/24" \
+  ./bin/nox-server
+
+# клиент
+cd /opt/nox
+sudo pkill -f nox-client 2>/dev/null
+sudo ip link del nox1 2>/dev/null
+go build -o bin/nox-client ./cmd/nox-client
+sudo env \
+  NOX_KEY_HEX="<тот же ключ>" \
+  NOX_SERVER="<IP_сервера>:9000" \
+  NOX_CLIENT_CIDR="10.8.0.2/24" \
+  NOX_TUN="nox1" \
+  ./bin/nox-client
+
+# проверка
+ping 10.8.0.1
+ping -I nox1 8.8.8.8
+```
+
+Если TUN занят (`TUNSETIFF busy`) — повторно выполните `pkill` и `ip link del` для nox0/nox1 и запустите снова.

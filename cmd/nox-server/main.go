@@ -177,6 +177,24 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 	// release lease on any exit path unless explicitly released earlier
 	defer allocator.Release(sessionKey)
 
+
+	assignPayload := []byte{frame.CtrlAssignIP}
+	assignPayload = append(assignPayload, []byte(leaseCIDR)...)
+
+	if err := frame.Encode(conn, &frame.Frame{
+		Type:     frame.TypeControl,
+		StreamID: 0,
+		Flags:    0,
+		Payload:  assignPayload,
+	}); err != nil {
+		log.Println("assign send:", err)
+		allocator.Release(sessionKey)
+		return
+	}
+
+	// release lease on any exit path unless explicitly released earlier
+	defer allocator.Release(sessionKey)
+
 	kaDone := make(chan struct{})
 	var kaOnce sync.Once
 	closeKA := func() { kaOnce.Do(func() { close(kaDone) }) }
