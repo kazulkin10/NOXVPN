@@ -1,277 +1,239 @@
 package main
 
 import (
-"errors"
-"io"
-"log"
-"net"
-"sync"
-"time"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-"nox-core/internal/server"
-"nox-core/pkg/control"
-"nox-core/pkg/crypto"
-"nox-core/pkg/frame"
-"nox-core/pkg/tun"
+	"golang.org/x/crypto/chacha20poly1305"
+
+	ipam "nox-core/internal/server"
+	noxcrypto "nox-core/pkg/crypto"
+	"nox-core/pkg/frame"
+	"nox-core/pkg/tun"
 )
 
-type TokenBucket struct {
-rateBytesPerSec float64
-burstBytes      float64
-mu              sync.Mutex
-tokens          float64
-last            time.Time
-}
-
-func NewTokenBucket(rateBytesPerSec, burstBytes int64) *TokenBucket {
-now := time.Now()
-return &TokenBucket{
-rateBytesPerSec: float64(rateBytesPerSec),
-burstBytes:      float64(burstBytes),
-tokens:          float64(burstBytes),
-last:            now,
-}
-}
-
-func (t *TokenBucket) addTokens() {
-now := time.Now()
-dt := now.Sub(t.last).Seconds()
-t.last = now
-t.tokens += dt * t.rateBytesPerSec
-if t.tokens > t.burstBytes {
-t.tokens = t.burstBytes
-}
-}
-
-func (t *TokenBucket) Wait(n int) {
-need := float64(n)
-for {
-t.mu.Lock()
-t.addTokens()
-if t.tokens >= need {
-t.tokens -= need
-t.mu.Unlock()
-return
-}
-deficit := need - t.tokens
-rate := t.rateBytesPerSec
-t.mu.Unlock()
-
-if rate <= 0 {
-time.Sleep(50 * time.Millisecond)
-continue
-}
-sleepSec := deficit / rate
-if sleepSec < 0.01 {
-sleepSec = 0.01
-}
-time.Sleep(time.Duration(sleepSec * float64(time.Second)))
-}
-}
+const (
+	streamData  uint32 = 100
+	defaultCIDR        = "10.8.0.0/24"
+	leaseTTL           = 10 * time.Minute
+)
 
 func main() {
-t, err := tun.Create("nox0")
-if err != nil {
-log.Fatal("tun create:", err)
-}
-log.Println("TUN nox0 created")
+	addr := getenv("NOX_LISTEN", ":9000")
+	cidr := getenv("NOX_SUBNET", defaultCIDR)
 
-alloc, err := server.NewIPAlloc("10.8.0.0/24")
-if err != nil {
-log.Fatal("ipalloc:", err)
-}
+	keyHex := strings.TrimSpace(os.Getenv("NOX_KEY_HEX"))
+	if keyHex == "" {
+		log.Fatal("NOX_KEY_HEX required")
+	}
+	k, err := hex.DecodeString(keyHex)
+	if err != nil {
+		log.Fatalf("decode NOX_KEY_HEX: %v", err)
+	}
+	if len(k) != chacha20poly1305.KeySize {
+		log.Fatalf("NOX_KEY_HEX must be %d bytes", chacha20poly1305.KeySize)
+	}
 
-// reap idle leases (safety net)
-go func() {
-for {
-time.Sleep(30 * time.Second)
-alloc.ReapIdle(90 * time.Second)
-}
-}()
+	ciph, err := noxcrypto.NewCipherFromKey(k)
+	if err != nil {
+		log.Fatalf("cipher init: %v", err)
+	}
 
-ln, err := net.Listen("tcp", ":9000")
-if err != nil {
-log.Fatal(err)
-}
-log.Println("NOX server listening on :9000")
+	t, err := tun.Create("nox0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("TUN nox0 created")
 
-for {
-conn, err := ln.Accept()
-if err != nil {
-log.Println("accept:", err)
-continue
-}
-log.Println("client connected from", conn.RemoteAddr())
-go handleConn(conn, t, alloc)
-}
-}
+	allocator, err := ipam.NewIPAlloc(cidr)
+	if err != nil {
+		log.Fatalf("ip alloc: %v", err)
+	}
 
-func handleConn(conn net.Conn, t *tun.Tun, alloc *server.IPAlloc) {
-defer conn.Close()
+	go func() {
+		tk := time.NewTicker(5 * time.Minute)
+		defer tk.Stop()
+		for range tk.C {
+			if killed := allocator.ReapIdle(leaseTTL); killed > 0 {
+				log.Printf("ipam: reaped %d idle lease(s)\n", killed)
+			}
+		}
+	}()
 
-ciph, err := crypto.NewCipher()
-if err != nil {
-log.Println("cipher init:", err)
-return
-}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("NOX server listening on", addr)
 
-limiter := NewTokenBucket(10*1024*1024/8, 20*1024*1024/8)
-
-// session state
-var (
-sess       [8]byte
-sessOK     bool
-lastBeat   = time.Now()
-beatMu     sync.Mutex
-closeOnce  sync.Once
-closeCh    = make(chan struct{})
-)
-
-// killer for hung clients (no heartbeat)
-go func() {
-tick := time.NewTicker(10 * time.Second)
-defer tick.Stop()
-for {
-select {
-case <-tick.C:
-beatMu.Lock()
-idle := time.Since(lastBeat)
-beatMu.Unlock()
-if idle > 45*time.Second {
-closeOnce.Do(func() { close(closeCh) })
-_ = conn.Close()
-return
-}
-case <-closeCh:
-return
-}
-}
-}()
-
-// TUN -> client (stream 100)
-go func() {
-pktBuf := make([]byte, 65535)
-for {
-select {
-case <-closeCh:
-return
-default:
-}
-n, err := t.ReadPacket(pktBuf)
-if err != nil {
-log.Println("tun read:", err)
-closeOnce.Do(func() { close(closeCh) })
-_ = conn.Close()
-return
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Println("accept:", err)
+			continue
+		}
+		go handle(conn, t, ciph, allocator)
+	}
 }
 
-enc, err := ciph.EncryptFrame(pktBuf[:n])
-if err != nil {
-log.Println("enc tun:", err)
-closeOnce.Do(func() { close(closeCh) })
-_ = conn.Close()
-return
+func sessionIDForClient(clientID string) [8]byte {
+	sum := sha256.Sum256([]byte(clientID))
+	var out [8]byte
+	copy(out[:], sum[:])
+	return out
 }
 
-fr := frame.NewEncryptedFrame(frame.FrameData, 100, enc)
-data, _ := frame.EncodeFrame(fr)
+func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.IPAlloc) {
+	defer conn.Close()
 
-limiter.Wait(len(data))
-if _, err := conn.Write(data); err != nil {
-log.Println("write tun frame:", err)
-closeOnce.Do(func() { close(closeCh) })
-return
-}
-}
-}()
+	ra := conn.RemoteAddr().String()
+	clientID := strings.Split(ra, ":")[0]
+	sessionID := sessionIDForClient(clientID)
+	sessionKey := hex.EncodeToString(sessionID[:])
+	log.Println("client connected from", ra)
 
-defer func() {
-if sessOK {
-alloc.Release(sess)
-}
-closeOnce.Do(func() { close(closeCh) })
-}()
+	_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
 
-for {
-fr, err := frame.ReadFrame(conn)
-if err != nil {
-if errors.Is(err, io.EOF) {
-log.Println("client closed")
-return
-}
-log.Println("read frame:", err)
-return
+	lease, isNew, err := allocator.Acquire(sessionKey)
+	if err != nil {
+		total, used := allocator.Stats()
+		log.Printf("ipam: %v (used %d/%d)\n", err, used, total)
+		return
+	}
+	leaseCIDR := fmt.Sprintf("%s/%d", lease.IP.String(), lease.MaskBits)
+	if isNew {
+		log.Printf("ipam: lease %s for %s (new)\n", leaseCIDR, sessionKey)
+	} else {
+		log.Printf("ipam: lease %s for %s (reused)\n", leaseCIDR, sessionKey)
+	}
+
+	assignPayload := []byte{frame.CtrlAssignIP}
+	assignPayload = append(assignPayload, []byte(leaseCIDR)...)
+
+	if err := frame.Encode(conn, &frame.Frame{
+		Type:     frame.TypeControl,
+		StreamID: 0,
+		Flags:    0,
+		Payload:  assignPayload,
+	}); err != nil {
+		log.Println("assign send:", err)
+		allocator.Release(sessionKey)
+		return
+	}
+
+	// release lease on any exit path unless explicitly released earlier
+	defer allocator.Release(sessionKey)
+
+	kaDone := make(chan struct{})
+	var kaOnce sync.Once
+	closeKA := func() { kaOnce.Do(func() { close(kaDone) }) }
+	defer closeKA()
+
+	go func() {
+		tk := time.NewTicker(20 * time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-tk.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				_ = frame.Encode(conn, &frame.Frame{
+					Type:     frame.TypeControl,
+					StreamID: 0,
+					Flags:    0,
+					Payload:  []byte{frame.CtrlHeartbeat},
+				})
+				allocator.Touch(sessionKey)
+			case <-kaDone:
+				return
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+			fr, err := frame.Read(conn)
+			if err != nil {
+				log.Println("read frame:", err)
+				closeKA()
+				return
+			}
+
+			if fr.Type == frame.TypeControl {
+				if len(fr.Payload) > 0 {
+					switch fr.Payload[0] {
+					case frame.CtrlReleaseIP:
+						allocator.Release(sessionKey)
+					case frame.CtrlHeartbeat:
+						allocator.Touch(sessionKey)
+					}
+				}
+				continue
+			}
+
+			pt, err := ciph.Open(fr.Payload)
+			if err != nil {
+				log.Println("decrypt:", err)
+				continue
+			}
+
+			allocator.Touch(sessionKey)
+
+			if fr.StreamID == streamData {
+				if _, err := t.WritePacket(pt); err != nil {
+					log.Println("tun write:", err)
+					continue
+				}
+			}
+		}
+	}()
+
+	buf := make([]byte, 65535)
+	for {
+		n, err := t.ReadPacket(buf)
+		if err != nil {
+			log.Println("tun read:", err)
+			return
+		}
+		enc := ciph.Seal(buf[:n])
+
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := frame.Encode(conn, &frame.Frame{
+			Type:     frame.TypeData,
+			StreamID: streamData,
+			Flags:    0,
+			Payload:  enc,
+		}); err != nil {
+			log.Println("conn write:", err)
+			return
+		}
+	}
 }
 
-// ping/pong at frame layer (optional)
-if fr.Type == frame.FramePing {
-pong := &frame.Frame{Type: frame.FramePong, Flags: 0, StreamID: fr.StreamID, Payload: nil}
-raw, _ := frame.EncodeFrame(pong)
-limiter.Wait(len(raw))
-_, _ = conn.Write(raw)
-continue
-}
-if fr.Type == frame.FrameClose {
-log.Println("got close")
-return
-}
-if fr.Type != frame.FrameData {
-continue
+func getenv(k, def string) string {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	return v
 }
 
-pt, err := ciph.DecryptFrame(fr.Payload)
-if err != nil {
-log.Println("decrypt:", err)
-return
-}
-
-// control channel = stream 0
-if fr.StreamID == 0 {
-op, rest, ok := control.Decode(pt)
-if !ok {
-continue
-}
-
-switch op {
-case control.OpHello:
-s, ok := control.DecodeSession(rest)
-if !ok {
-continue
-}
-sess = s
-sessOK = true
-alloc.Touch(sess)
-
-ip, mask, _ := alloc.Acquire(sess)
-msg, _ := control.EncodeAssignIP(ip, mask)
-enc, _ := ciph.EncryptFrame(msg)
-
-resp := frame.NewEncryptedFrame(frame.FrameData, 0, enc)
-raw, _ := frame.EncodeFrame(resp)
-limiter.Wait(len(raw))
-_, _ = conn.Write(raw)
-
-beatMu.Lock()
-lastBeat = time.Now()
-beatMu.Unlock()
-
-case control.OpBeat:
-if sessOK {
-alloc.Touch(sess)
-}
-beatMu.Lock()
-lastBeat = time.Now()
-beatMu.Unlock()
-}
-continue
-}
-
-// stream 100 = IP packets to server TUN
-if fr.StreamID == 100 {
-if _, err := t.WritePacket(pt); err != nil {
-log.Println("tun write:", err)
-}
-continue
-}
-}
+func getenvInt(k string, def int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
