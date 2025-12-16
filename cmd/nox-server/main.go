@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/crypto/chacha20poly1305"
 
 	"nox-core/internal/server"
@@ -58,7 +59,7 @@ func main() {
 	}
 	log.Println("TUN nox0 created")
 	if err := configureServerTUN("nox0", cidr); err != nil {
-		log.Printf("warn: tun setup: %v\n", err)
+		log.Fatalf("tun setup failed: %v", err)
 	}
 
 	allocator, err := ipam.NewIPAlloc(cidr)
@@ -316,17 +317,16 @@ func loadKey() ([]byte, error) {
 	return k, nil
 }
 
-func cleanupTUN(name string) {
-	_ = exec.Command("ip", "link", "del", name).Run()
-	_ = exec.Command("ip", "tuntap", "del", "dev", name, "mode", "tun").Run()
-}
-
 func configureServerTUN(name, cidr string) error {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return fmt.Errorf("lookup link %s: %w", name, err)
+	}
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return err
 	}
-	ones, bits := ipnet.Mask.Size()
+	_, bits := ipnet.Mask.Size()
 	if bits != 32 {
 		return fmt.Errorf("only IPv4 cidr supported")
 	}
@@ -337,16 +337,24 @@ func configureServerTUN(name, cidr string) error {
 	gw := make(net.IP, len(base))
 	copy(gw, base)
 	gw[3]++
-	gwCIDR := fmt.Sprintf("%s/%d", gw.String(), ones)
-	cmds := [][]string{
-		{"ip", "addr", "replace", gwCIDR, "dev", name},
-		{"ip", "link", "set", name, "up"},
-		{"ip", "route", "replace", cidr, "dev", name},
+	gwNet := &net.IPNet{IP: gw, Mask: ipnet.Mask}
+
+	addr := &netlink.Addr{IPNet: gwNet}
+	if err := netlink.AddrReplace(link, addr); err != nil {
+		return fmt.Errorf("addr replace %s: %w", gwNet.String(), err)
 	}
-	for _, cmd := range cmds {
-		if err := exec.Command(cmd[0], cmd[1:]...).Run(); err != nil {
-			return fmt.Errorf("%s failed: %w", strings.Join(cmd, " "), err)
-		}
+	if err := netlink.LinkSetUp(link); err != nil {
+		return fmt.Errorf("link set up: %w", err)
 	}
+	route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: ipnet}
+	if err := netlink.RouteReplace(route); err != nil {
+		return fmt.Errorf("route replace %s: %w", ipnet.String(), err)
+	}
+	log.Printf("tun %s up addr=%s route=%s\n", name, gwNet.String(), ipnet.String())
 	return nil
+}
+
+func cleanupTUN(name string) {
+	_ = exec.Command("ip", "link", "del", name).Run()
+	_ = exec.Command("ip", "tuntap", "del", "dev", name, "mode", "tun").Run()
 }
