@@ -111,9 +111,6 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 	}); err != nil {
 		log.Println("assign send:", err)
 
-		return
-	}
-
 	kaDone := make(chan struct{})
 	var kaOnce sync.Once
 	closeKA := func() { kaOnce.Do(func() { close(kaDone) }) }
@@ -154,7 +151,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 				if len(fr.Payload) > 0 {
 					switch fr.Payload[0] {
 					case frame.CtrlReleaseIP:
-n
+
 					}
 				}
 				continue
@@ -166,7 +163,7 @@ n
 				continue
 			}
 
-
+n
 
 			if fr.StreamID == streamData {
 				if _, err := t.WritePacket(pt); err != nil {

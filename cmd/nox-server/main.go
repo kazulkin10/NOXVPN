@@ -99,7 +99,6 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 	_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
 
 
-
 	assignPayload := []byte{frame.CtrlAssignIP}
 	assignPayload = append(assignPayload, []byte(leaseCIDR)...)
 
@@ -110,9 +109,6 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 		Payload:  assignPayload,
 	}); err != nil {
 		log.Println("assign send:", err)
-
-		return
-	}
 
 	kaDone := make(chan struct{})
 	var kaOnce sync.Once
@@ -165,7 +161,6 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 				log.Println("decrypt:", err)
 				continue
 			}
-
 
 
 			if fr.StreamID == streamData {
