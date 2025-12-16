@@ -81,3 +81,57 @@ func TestIPAllocExhaustion(t *testing.T) {
 		t.Fatalf("expected exhaustion error")
 	}
 }
+
+func TestIPAllocReleaseAndReacquireSameIP(t *testing.T) {
+	alloc, err := NewIPAlloc("10.8.0.0/29")
+	if err != nil {
+		t.Fatalf("new ipalloc: %v", err)
+	}
+
+	lease1, fresh, err := alloc.Acquire("sess-a")
+	if err != nil || !fresh {
+		t.Fatalf("acquire: fresh=%v err=%v", fresh, err)
+	}
+
+	alloc.Release("sess-a")
+
+	lease2, fresh, err := alloc.Acquire("sess-a")
+	if err != nil || !fresh {
+		t.Fatalf("reacquire: fresh=%v err=%v", fresh, err)
+	}
+	if lease1.IP.String() != lease2.IP.String() {
+		t.Fatalf("expected same IP after release/reacquire, got %s vs %s", lease1.IP, lease2.IP)
+	}
+}
+
+func TestIPAllocSameSessionReconnectDoesNotGrowPool(t *testing.T) {
+	alloc, err := NewIPAlloc("10.8.0.0/29")
+	if err != nil {
+		t.Fatalf("new ipalloc: %v", err)
+	}
+
+	lease1, fresh, err := alloc.Acquire("sess-a")
+	if err != nil || !fresh {
+		t.Fatalf("first acquire: fresh=%v err=%v", fresh, err)
+	}
+
+	lease2, fresh, err := alloc.Acquire("sess-a")
+	if err != nil || fresh {
+		t.Fatalf("second acquire should reuse: fresh=%v err=%v", fresh, err)
+	}
+	if lease1.IP.String() != lease2.IP.String() {
+		t.Fatalf("expected same IP on reconnect: %s vs %s", lease1.IP, lease2.IP)
+	}
+
+	lease3, fresh, err := alloc.Acquire("sess-b")
+	if err != nil || !fresh {
+		t.Fatalf("third acquire: fresh=%v err=%v", fresh, err)
+	}
+	if lease3.IP.String() == lease1.IP.String() {
+		t.Fatalf("sess-b should get different IP")
+	}
+
+	if total, used := alloc.Stats(); used != 2 {
+		t.Fatalf("expected used=2 after reconnect+second session, got %d/%d", used, total)
+	}
+}

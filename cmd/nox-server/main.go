@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,14 +16,6 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 
 	"nox-core/internal/server"
-
-	"strings"
-	"sync"
-	"time"
-
-	"golang.org/x/crypto/chacha20poly1305"
-
-
 	ipam "nox-core/internal/server"
 	noxcrypto "nox-core/pkg/crypto"
 	"nox-core/pkg/frame"
@@ -39,7 +32,6 @@ const (
 	defaultHandshakeRPS   = 20
 	defaultHandshakeBurst = 40
 	defaultMaxClients     = 256
-
 )
 
 func main() {
@@ -49,17 +41,9 @@ func main() {
 	handshakeBurst := getenvInt("NOX_HANDSHAKE_BURST", defaultHandshakeBurst)
 	maxClients := getenvInt("NOX_MAX_CLIENTS", defaultMaxClients)
 
-
-	keyHex := strings.TrimSpace(os.Getenv("NOX_KEY_HEX"))
-	if keyHex == "" {
-		log.Fatal("NOX_KEY_HEX required")
-	}
-	k, err := hex.DecodeString(keyHex)
+	k, err := loadKey()
 	if err != nil {
-		log.Fatalf("decode NOX_KEY_HEX: %v", err)
-	}
-	if len(k) != chacha20poly1305.KeySize {
-		log.Fatalf("NOX_KEY_HEX must be %d bytes", chacha20poly1305.KeySize)
+		log.Fatal(err)
 	}
 
 	ciph, err := noxcrypto.NewCipherFromKey(k)
@@ -67,15 +51,22 @@ func main() {
 		log.Fatalf("cipher init: %v", err)
 	}
 
+	cleanupTUN("nox0")
 	t, err := tun.Create("nox0")
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Println("TUN nox0 created")
+	if err := configureServerTUN("nox0", cidr); err != nil {
+		log.Printf("warn: tun setup: %v\n", err)
+	}
 
 	allocator, err := ipam.NewIPAlloc(cidr)
 	if err != nil {
 		log.Fatalf("ip alloc: %v", err)
+	}
+	if total, used := allocator.Stats(); true {
+		log.Printf("ipam: subnet %s total=%d used=%d\n", cidr, total, used)
 	}
 
 	limiter := server.NewTokenBucket(handshakeRPS, handshakeBurst)
@@ -122,7 +113,7 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 		return
 	}
 
-	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	fr, err := frame.Read(conn)
 	if err != nil {
 		log.Println("hello read:", err)
@@ -143,13 +134,21 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 	lease, isNew, err := allocator.Acquire(sessionKey)
 	if err != nil {
 		total, used := allocator.Stats()
-		log.Printf("ipam: %v (used %d/%d)\n", err, used, total)
+		log.Printf("ipam: %v (used=%d/%d)\n", err, used, total)
 		return
 	}
+	leaseHeld := true
+	defer func() {
+		if leaseHeld {
+			allocator.Release(sessionKey)
+		}
+	}()
+
 	if maxClients > 0 {
 		if _, used := allocator.Stats(); used > maxClients {
 			log.Printf("reject: max clients %d reached\n", maxClients)
 			allocator.Release(sessionKey)
+			leaseHeld = false
 			return
 		}
 	}
@@ -171,29 +170,9 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 	}); err != nil {
 		log.Println("assign send:", err)
 		allocator.Release(sessionKey)
+		leaseHeld = false
 		return
 	}
-
-	// release lease on any exit path unless explicitly released earlier
-	defer allocator.Release(sessionKey)
-
-
-	assignPayload := []byte{frame.CtrlAssignIP}
-	assignPayload = append(assignPayload, []byte(leaseCIDR)...)
-
-	if err := frame.Encode(conn, &frame.Frame{
-		Type:     frame.TypeControl,
-		StreamID: 0,
-		Flags:    0,
-		Payload:  assignPayload,
-	}); err != nil {
-		log.Println("assign send:", err)
-		allocator.Release(sessionKey)
-		return
-	}
-
-	// release lease on any exit path unless explicitly released earlier
-	defer allocator.Release(sessionKey)
 
 	kaDone := make(chan struct{})
 	var kaOnce sync.Once
@@ -275,10 +254,6 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
-	buf := make([]byte, 65535)
-	for {
-		n, err := t.ReadPacket(buf)
-		if err != nil {
 			log.Println("tun read:", err)
 			return
 		}
@@ -315,5 +290,63 @@ func getenvInt(k string, def int) int {
 		return def
 	}
 	return n
+}
 
+func loadKey() ([]byte, error) {
+	keyHex := strings.TrimSpace(os.Getenv("NOX_KEY_HEX"))
+	if keyHex == "" {
+		if path := strings.TrimSpace(os.Getenv("NOX_KEY_FILE")); path != "" {
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("read NOX_KEY_FILE: %w", err)
+			}
+			keyHex = strings.TrimSpace(string(raw))
+		}
+	}
+	if keyHex == "" {
+		return nil, fmt.Errorf("NOX_KEY_HEX required (or set NOX_KEY_FILE)")
+	}
+	k, err := hex.DecodeString(keyHex)
+	if err != nil {
+		return nil, fmt.Errorf("decode NOX_KEY_HEX: %w", err)
+	}
+	if len(k) != chacha20poly1305.KeySize {
+		return nil, fmt.Errorf("NOX_KEY_HEX must be %d bytes", chacha20poly1305.KeySize)
+	}
+	return k, nil
+}
+
+func cleanupTUN(name string) {
+	_ = exec.Command("ip", "link", "del", name).Run()
+	_ = exec.Command("ip", "tuntap", "del", "dev", name, "mode", "tun").Run()
+}
+
+func configureServerTUN(name, cidr string) error {
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return err
+	}
+	ones, bits := ipnet.Mask.Size()
+	if bits != 32 {
+		return fmt.Errorf("only IPv4 cidr supported")
+	}
+	base := ipnet.IP.To4()
+	if base == nil {
+		return fmt.Errorf("bad base ip")
+	}
+	gw := make(net.IP, len(base))
+	copy(gw, base)
+	gw[3]++
+	gwCIDR := fmt.Sprintf("%s/%d", gw.String(), ones)
+	cmds := [][]string{
+		{"ip", "addr", "replace", gwCIDR, "dev", name},
+		{"ip", "link", "set", name, "up"},
+		{"ip", "route", "replace", cidr, "dev", name},
+	}
+	for _, cmd := range cmds {
+		if err := exec.Command(cmd[0], cmd[1:]...).Run(); err != nil {
+			return fmt.Errorf("%s failed: %w", strings.Join(cmd, " "), err)
+		}
+	}
+	return nil
 }
