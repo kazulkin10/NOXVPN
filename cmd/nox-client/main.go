@@ -1,7 +1,7 @@
 package main
 
 import (
-
+	"crypto/rand"
 	"encoding/hex"
 	"log"
 	"net"
@@ -29,6 +29,7 @@ func main() {
 	staticCIDR := getenv("NOX_CLIENT_CIDR", "10.8.0.2/24")
 	tunName := getenv("NOX_TUN", "nox1")
 
+	loadSessionID()
 
 	keyHex := strings.TrimSpace(os.Getenv("NOX_KEY_HEX"))
 	if keyHex == "" {
@@ -69,9 +70,25 @@ func runOnce(server, staticCIDR, tunName string, ciph *noxcrypto.Cipher) error {
 		return err
 	}
 	log.Println("client TUN", tunName, "created")
+	defer func() {
+		_ = t.Close()
+		// best-effort удалить интерфейс, чтобы избежать TUNSETIFF busy при следующем запуске
+		_ = exec.Command("ip", "link", "del", tunName).Run()
+	}()
 
 	assigned := staticCIDR
 
+	// отправляем HELLO с SessionID
+	helloPayload := append([]byte{frame.CtrlHello}, sessionID[:]...)
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := frame.Encode(conn, &frame.Frame{
+		Type:     frame.TypeControl,
+		StreamID: 0,
+		Flags:    0,
+		Payload:  helloPayload,
+	}); err != nil {
+		return err
+	}
 
 	// ждём control AssignIP
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -89,6 +106,7 @@ func runOnce(server, staticCIDR, tunName string, ciph *noxcrypto.Cipher) error {
 	exec.Command("sh", "-c", "ip link set "+tunName+" up").Run()
 	exec.Command("sh", "-c", "ip route replace 10.8.0.0/24 dev "+tunName).Run()
 
+	// keepalive sender + сигнал остановки обоих направлений
 	// keepalive sender
 	kaDone := make(chan struct{})
 	var kaOnce sync.Once
@@ -130,11 +148,15 @@ func runOnce(server, staticCIDR, tunName string, ciph *noxcrypto.Cipher) error {
 			pt, err := ciph.Open(fr.Payload)
 			if err != nil {
 				log.Println("decrypt:", err)
+				closeKA()
+				return
 				continue
 			}
 			if fr.StreamID == streamData {
 				if _, err := t.WritePacket(pt); err != nil {
 					log.Println("tun write:", err)
+					closeKA()
+					return
 				}
 			}
 		}
@@ -143,6 +165,18 @@ func runOnce(server, staticCIDR, tunName string, ciph *noxcrypto.Cipher) error {
 	// tun -> conn
 	buf := make([]byte, 65535)
 	for {
+		select {
+		case <-kaDone:
+			return nil
+		default:
+		}
+
+		_ = t.SetReadDeadline(time.Now().Add(time.Second))
+		n, err := t.ReadPacket(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
 		n, err := t.ReadPacket(buf)
 		if err != nil {
 			closeKA()
@@ -168,5 +202,17 @@ func getenv(k, def string) string {
 		return def
 	}
 	return v
+}
+
+func loadSessionID() {
+	if v := strings.TrimSpace(os.Getenv("NOX_SESSION_ID")); len(v) == 16 {
+		if b, err := hex.DecodeString(v); err == nil {
+			copy(sessionID[:], b)
+			return
+		}
+	}
+	if _, err := rand.Read(sessionID[:]); err != nil {
+		log.Fatalf("session id gen: %v", err)
+	}
 n
 }

@@ -20,6 +20,7 @@ const (
 	CtrlAssignIP  = 0x01
 	CtrlReleaseIP = 0x02
 	CtrlHeartbeat = 0x03
+	CtrlHello     = 0x04 // client -> server: payload[1:9]=SessionID (8 bytes)
 
 )
 
