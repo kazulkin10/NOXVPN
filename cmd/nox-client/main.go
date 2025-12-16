@@ -107,6 +107,7 @@ func runOnce(server, staticCIDR, tunName string, ciph *noxcrypto.Cipher) error {
 	exec.Command("sh", "-c", "ip route replace 10.8.0.0/24 dev "+tunName).Run()
 
 	// keepalive sender + сигнал остановки обоих направлений
+	// keepalive sender
 	kaDone := make(chan struct{})
 	var kaOnce sync.Once
 	closeKA := func() { kaOnce.Do(func() { close(kaDone) }) }
@@ -149,6 +150,7 @@ func runOnce(server, staticCIDR, tunName string, ciph *noxcrypto.Cipher) error {
 				log.Println("decrypt:", err)
 				closeKA()
 				return
+				continue
 			}
 			if fr.StreamID == streamData {
 				if _, err := t.WritePacket(pt); err != nil {
@@ -175,6 +177,8 @@ func runOnce(server, staticCIDR, tunName string, ciph *noxcrypto.Cipher) error {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+		n, err := t.ReadPacket(buf)
+		if err != nil {
 			closeKA()
 			return err
 		}
@@ -210,4 +214,5 @@ func loadSessionID() {
 	if _, err := rand.Read(sessionID[:]); err != nil {
 		log.Fatalf("session id gen: %v", err)
 	}
+n
 }
