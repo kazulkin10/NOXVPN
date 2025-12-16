@@ -1,193 +1,223 @@
 package main
 
 import (
-"log"
-"net"
-"os"
-"strings"
-"time"
+	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"strings"
 	"sync"
+	"time"
 
-noxcrypto "nox-core/pkg/crypto"
-"nox-core/pkg/frame"
-"nox-core/pkg/tun"
-ipam "nox-core/internal/server"
+	"golang.org/x/crypto/chacha20poly1305"
+
+	ipam "nox-core/internal/server"
+	noxcrypto "nox-core/pkg/crypto"
+	"nox-core/pkg/frame"
+	"nox-core/pkg/tun"
 )
 
 const (
-streamData uint32 = 100
+	streamData  uint32 = 100
+	defaultCIDR        = "10.8.0.0/24"
+	leaseTTL           = 10 * time.Minute
 )
 
 func main() {
-	keyHex := os.Getenv("NOX_KEY_HEX")
-	if strings.TrimSpace(keyHex) == "" { log.Fatal("NOX_KEY_HEX required") }
-	k, err := hex.DecodeString(strings.TrimSpace(keyHex))
-	if err != nil { log.Fatal(err) }
+	addr := getenv("NOX_LISTEN", ":9000")
+	cidr := getenv("NOX_SUBNET", defaultCIDR)
+
+	keyHex := strings.TrimSpace(os.Getenv("NOX_KEY_HEX"))
+	if keyHex == "" {
+		log.Fatal("NOX_KEY_HEX required")
+	}
+	k, err := hex.DecodeString(keyHex)
+	if err != nil {
+		log.Fatalf("decode NOX_KEY_HEX: %v", err)
+	}
+	if len(k) != chacha20poly1305.KeySize {
+		log.Fatalf("NOX_KEY_HEX must be %d bytes", chacha20poly1305.KeySize)
+	}
+
 	ciph, err := noxcrypto.NewCipherFromKey(k)
-	if err != nil { log.Fatal(err) }
+	if err != nil {
+		log.Fatalf("cipher init: %v", err)
+	}
 
-addr := getenv("NOX_LISTEN", ":9000")
+	t, err := tun.Create("nox0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("TUN nox0 created")
 
-var ciph *noxcrypto.Cipher
-// ВАРВАРСКИ: если ключ не задан — генерим и печатаем (потом заменишь на стабильный конфиг)
-if keyHex == "" {
-if err != nil { log.Fatal(err) }
-// сырой вывод, чтобы ты руками перенёс в env на обеих сторонах
-if err != nil { log.Fatal(err) }
-} else {
-// если хочешь hex — добавишь потом; сейчас не тормозим разработку.
-if err != nil { log.Fatal(err) }
-if err != nil { log.Fatal(err) }
+	allocator, err := ipam.NewIPAlloc(cidr)
+	if err != nil {
+		log.Fatalf("ip alloc: %v", err)
+	}
+
+	go func() {
+		tk := time.NewTicker(5 * time.Minute)
+		defer tk.Stop()
+		for range tk.C {
+			if killed := allocator.ReapIdle(leaseTTL); killed > 0 {
+				log.Printf("ipam: reaped %d idle lease(s)\n", killed)
+			}
+		}
+	}()
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("NOX server listening on", addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Println("accept:", err)
+			continue
+		}
+		go handle(conn, t, ciph, allocator)
+	}
 }
 
-t, err := tun.Create("nox0")
-if err != nil {
-log.Fatal(err)
-}
-log.Println("TUN nox0 created")
-
-ipam := ipam.NewIPAM()
-go func() {
-tk := time.NewTicker(5 * time.Minute)
-defer tk.Stop()
-for range tk.C {
-ipam.GC()
-}
-}()
-
-ln, err := net.Listen("tcp", addr)
-if err != nil {
-log.Fatal(err)
-}
-log.Println("NOX server listening on", addr)
-
-for {
-conn, err := ln.Accept()
-if err != nil {
-log.Println("accept:", err)
-continue
-}
-go handle(conn, t, ciph, ipam)
-}
+func sessionIDForClient(clientID string) [8]byte {
+	sum := sha256.Sum256([]byte(clientID))
+	var out [8]byte
+	copy(out[:], sum[:])
+	return out
 }
 
-func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, ipam *ipam.IPAM) {
-defer conn.Close()
+func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.IPAlloc) {
+	defer conn.Close()
 
-ra := conn.RemoteAddr().String()
-clientID := strings.Split(ra, ":")[0]
-log.Println("client connected from", ra)
+	ra := conn.RemoteAddr().String()
+	clientID := strings.Split(ra, ":")[0]
+	sessionID := sessionIDForClient(clientID)
+	sessionKey := hex.EncodeToString(sessionID[:])
+	log.Println("client connected from", ra)
 
-_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
 
-// Assign IP (control)
-lease, err := ipam.Allocate(clientID)
-if err != nil {
-log.Println("ipam:", err)
-return
-}
-assignPayload := []byte{frame.CtrlAssignIP}
-assignPayload = append(assignPayload, []byte(lease.CIDR)...)
+	lease, isNew, err := allocator.Acquire(sessionKey)
+	if err != nil {
+		total, used := allocator.Stats()
+		log.Printf("ipam: %v (used %d/%d)\n", err, used, total)
+		return
+	}
+	leaseCIDR := fmt.Sprintf("%s/%d", lease.IP.String(), lease.MaskBits)
+	if isNew {
+		log.Printf("ipam: lease %s for %s (new)\n", leaseCIDR, sessionKey)
+	} else {
+		log.Printf("ipam: lease %s for %s (reused)\n", leaseCIDR, sessionKey)
+	}
 
-if err := frame.Encode(conn, &frame.Frame{
-Type:   frame.TypeControl,
-Stream: 0,
-Flags:  0,
-Payload: assignPayload,
-}); err != nil {
-log.Println("assign send:", err)
-ipam.Release(clientID)
-return
-}
+	assignPayload := []byte{frame.CtrlAssignIP}
+	assignPayload = append(assignPayload, []byte(leaseCIDR)...)
 
-// keepalive sender
-kaDone := make(chan struct{})
+	if err := frame.Encode(conn, &frame.Frame{
+		Type:     frame.TypeControl,
+		StreamID: 0,
+		Flags:    0,
+		Payload:  assignPayload,
+	}); err != nil {
+		log.Println("assign send:", err)
+		allocator.Release(sessionKey)
+		return
+	}
+
+	kaDone := make(chan struct{})
 	var kaOnce sync.Once
-	closeKA := func(){ kaOnce.Do(func(){ close(kaDone) }) }
+	closeKA := func() { kaOnce.Do(func() { close(kaDone) }) }
+	defer closeKA()
 
+	go func() {
+		tk := time.NewTicker(20 * time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-tk.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				_ = frame.Encode(conn, &frame.Frame{
+					Type:     frame.TypeControl,
+					StreamID: 0,
+					Flags:    0,
+					Payload:  []byte{frame.CtrlHeartbeat},
+				})
+				allocator.Touch(sessionKey)
+			case <-kaDone:
+				return
+			}
+		}
+	}()
 
+	go func() {
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+			fr, err := frame.Read(conn)
+			if err != nil {
+				log.Println("read frame:", err)
+				closeKA()
+				return
+			}
 
+			if fr.Type == frame.TypeControl {
+				if len(fr.Payload) > 0 {
+					switch fr.Payload[0] {
+					case frame.CtrlReleaseIP:
+						allocator.Release(sessionKey)
+					case frame.CtrlHeartbeat:
+						allocator.Touch(sessionKey)
+					}
+				}
+				continue
+			}
 
-go func() {
-tk := time.NewTicker(20 * time.Second)
-defer tk.Stop()
-for {
-select {
-case <-tk.C:
-_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-_ = frame.Encode(conn, &frame.Frame{
-Type: frame.TypeControl, Stream: 0, Flags: 0,
-Payload: []byte{frame.CtrlHeartbeat},
-})
-case <-kaDone:
-return
-}
-}
-}()
+			pt, err := ciph.Open(fr.Payload)
+			if err != nil {
+				log.Println("decrypt:", err)
+				continue
+			}
 
-// conn -> tun
-go func() {
-for {
-_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-fr, err := frame.Read(conn)
-if err != nil {
-log.Println("read frame:", err)
-closeKA()
-ipam.Release(clientID)
-return
-}
+			allocator.Touch(sessionKey)
 
-if fr.Type == frame.TypeControl {
-if len(fr.Payload) > 0 && fr.Payload[0] == frame.CtrlReleaseIP {
-ipam.Release(clientID)
-}
-continue
-}
+			if fr.StreamID == streamData {
+				if _, err := t.WritePacket(pt); err != nil {
+					log.Println("tun write:", err)
+					continue
+				}
+			}
+		}
+	}()
 
-pt, err := ciph.Open(fr.Payload)
-if err != nil {
-log.Println("decrypt:", err)
-continue
-}
+	buf := make([]byte, 65535)
+	for {
+		n, err := t.ReadPacket(buf)
+		if err != nil {
+			log.Println("tun read:", err)
+			return
+		}
+		enc := ciph.Seal(buf[:n])
 
-if fr.Stream == streamData {
-if _, err := t.WritePacket(pt); err != nil {
-log.Println("tun write:", err)
-continue
-}
-}
-}
-}()
-
-// tun -> conn
-buf := make([]byte, 65535)
-for {
-n, err := t.ReadPacket(buf)
-if err != nil {
-log.Println("tun read:", err)
-closeKA()
-ipam.Release(clientID)
-return
-}
-enc := ciph.Seal(buf[:n])
-
-_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-if err := frame.Encode(conn, &frame.Frame{
-Type: frame.TypeData, Stream: streamData, Flags: 0, Payload: enc,
-}); err != nil {
-log.Println("conn write:", err)
-closeKA()
-ipam.Release(clientID)
-return
-}
-}
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := frame.Encode(conn, &frame.Frame{
+			Type:     frame.TypeData,
+			StreamID: streamData,
+			Flags:    0,
+			Payload:  enc,
+		}); err != nil {
+			log.Println("conn write:", err)
+			return
+		}
+	}
 }
 
 func getenv(k, def string) string {
-v := os.Getenv(k)
-if v == "" {
-return def
-}
-return v
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	return v
 }
