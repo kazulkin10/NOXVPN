@@ -1,0 +1,142 @@
+# NOX VPN (Go)
+
+Минимальный VPN-туннель сервер↔клиент на TUN-интерфейсах. Цель — поднять рабочий туннель без лишних фич: сервер слушает TCP `:9000`, поднимает TUN `nox0`, клиент подключается, поднимает `nox1`, получает IP в подсети `10.8.0.0/24` и шлёт трафик через туннель.
+
+## Быстрый старт
+
+### Генерация ключа
+
+Обе стороны используют один общий ключ ChaCha20-Poly1305 (32 байта, 64 hex-символа):
+
+```bash
+openssl rand -hex 32
+```
+
+Экспортируйте значение в переменную окружения `NOX_KEY_HEX` и передавайте её серверу и клиенту.
+
+### Сборка
+
+```bash
+go test ./...
+go build ./...
+```
+
+Сборка конкретных бинарников:
+
+```bash
+go build -o bin/nox-server ./cmd/nox-server
+go build -o bin/nox-client ./cmd/nox-client
+```
+
+### Запуск сервера
+
+```bash
+export NOX_KEY_HEX=<64-hex-символа>
+export NOX_LISTEN=:9000            # опционально, по умолчанию :9000
+export NOX_SUBNET=10.8.0.0/24      # опционально, по умолчанию 10.8.0.0/24
+
+sudo ./bin/nox-server
+```
+
+Сервер поднимает TUN `nox0`, раздаёт адреса начиная с `10.8.0.2/24`, шлёт keepalive каждые 20 секунд и придерживает аренды (lease) даже при разрыве TCP‑сессии — адрес освобождается по таймауту неактивности (10 минут) или по явному CtrlReleaseIP.
+
+### Запуск клиента
+
+```bash
+export NOX_KEY_HEX=<64-hex-символа>
+export NOX_SERVER=<server-ip>:9000 # по умолчанию 208.123.185.235:9000
+export NOX_CLIENT_CIDR=10.8.0.2/24 # fallback, если сервер не выдаст адрес
+export NOX_TUN=nox1                # имя клиентского TUN (по умолчанию nox1)
+
+sudo ./bin/nox-client
+```
+
+Клиент ждёт `AssignIP` от сервера, применяет адрес на `nox1`, отправляет heartbeat, шифрует трафик ChaCha20-Poly1305 и передаёт кадры `TypeData` в поток `100`.
+
+### Сетевые требования
+
+* На сервере включите IPv4 forwarding и NAT для подсети `10.8.0.0/24`, например:
+
+```bash
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
+```
+
+* После установления туннеля проверьте связность:
+  * `ping 10.8.0.1` (шлюз подсети)
+  * `ping -I nox1 8.8.8.8`
+
+## Переменные окружения
+
+Общие:
+- `NOX_KEY_HEX` — обязательный 64-символьный hex, 32 байта ключа.
+
+Сервер:
+- `NOX_LISTEN` — адрес для прослушивания (по умолчанию `:9000`).
+- `NOX_SUBNET` — подсеть выдачи адресов (по умолчанию `10.8.0.0/24`).
+
+Клиент:
+- `NOX_SERVER` — адрес сервера (по умолчанию `208.123.185.235:9000`).
+- `NOX_CLIENT_CIDR` — резервный адрес, если сервер не прислал `AssignIP`.
+- `NOX_TUN` — имя клиентского TUN (по умолчанию `nox1`).
+
+## Протокол (MVP)
+
+### Frame
+* `TypeData` — зашифрованные IP-пакеты для TUN (`StreamID=100`).
+* `TypeControl` — служебные команды.
+
+### Control opcodes
+* `CtrlHello` (client→server): payload[1:9] = SessionID (8 bytes). На основе SessionID сервер выдаёт/переиспользует IP.
+* `CtrlAssignIP` (server→client): payload = `10.8.0.X/24` (ASCII).
+* `CtrlHeartbeat` (двусторонний keepalive).
+* `CtrlReleaseIP` (client→server): просьба освободить lease.
+
+### IPAM и сессии
+* Sticky IP по SessionID, переиспользуется при переподключении.
+* TTL 10 минут, GC каждые 5 минут, освобождение при любом завершении соединения.
+* Wrap-around без дыр; no free IP → соединение закрывается.
+
+### Transport
+* TCP, шифрование ChaCha20-Poly1305, общий ключ `NOX_KEY_HEX` (32 байта, hex 64).
+* Handshake rate-limit (по умолчанию 20 rps, burst 40) и лимит клиентов (`NOX_MAX_CLIENTS`, по умолчанию 256).
+
+## Записка о стабильности
+
+* Сборка и тесты: `go test ./...` и `go build ./...` должны проходить перед деплоем.
+* Сервер и клиент завершают keepalive-горутину без паники `close of closed channel` благодаря `sync.Once`.
+
+## Быстрая проверка «с нуля»
+
+На всякий случай удаляем старые процессы и TUN-интерфейсы, потом собираем и запускаем.
+
+```bash
+# сервер
+cd /opt/nox
+sudo pkill -f nox-server 2>/dev/null
+sudo ip link del nox0 2>/dev/null
+go build -o bin/nox-server ./cmd/nox-server
+sudo env \
+  NOX_KEY_HEX="<64hex>" \
+  NOX_LISTEN=":9000" \
+  NOX_SUBNET="10.8.0.0/24" \
+  ./bin/nox-server
+
+# клиент
+cd /opt/nox
+sudo pkill -f nox-client 2>/dev/null
+sudo ip link del nox1 2>/dev/null
+go build -o bin/nox-client ./cmd/nox-client
+sudo env \
+  NOX_KEY_HEX="<тот же ключ>" \
+  NOX_SERVER="<IP_сервера>:9000" \
+  NOX_CLIENT_CIDR="10.8.0.2/24" \
+  NOX_TUN="nox1" \
+  ./bin/nox-client
+
+# проверка
+ping 10.8.0.1
+ping -I nox1 8.8.8.8
+```
+
+Если TUN занят (`TUNSETIFF busy`) — повторно выполните `pkill` и `ip link del` для nox0/nox1 и запустите снова.
