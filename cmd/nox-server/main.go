@@ -343,13 +343,38 @@ func configureServerTUN(name, cidr string) error {
 	if err := netlink.AddrReplace(link, addr); err != nil {
 		return fmt.Errorf("addr replace %s: %w", gwNet.String(), err)
 	}
-	if err := netlink.LinkSetUp(link); err != nil {
-		return fmt.Errorf("link set up: %w", err)
-	}
 	route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: ipnet}
 	if err := netlink.RouteReplace(route); err != nil {
 		return fmt.Errorf("route replace %s: %w", ipnet.String(), err)
 	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		return fmt.Errorf("link set up: %w", err)
+	}
+
+	// verify state and address
+	fresh, err := netlink.LinkByName(name)
+	if err != nil {
+		return fmt.Errorf("relookup %s: %w", name, err)
+	}
+	attrs := fresh.Attrs()
+	if attrs == nil || attrs.Flags&net.FlagUp == 0 {
+		return fmt.Errorf("tun %s is not UP after setup", name)
+	}
+	addrs, err := netlink.AddrList(fresh, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("addr list: %w", err)
+	}
+	found := false
+	for _, a := range addrs {
+		if a.IPNet != nil && a.IPNet.IP.Equal(gw) && a.IPNet.Mask.String() == gwNet.Mask.String() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("tun %s missing addr %s", name, gwNet.String())
+	}
+
 	log.Printf("tun %s up addr=%s route=%s\n", name, gwNet.String(), ipnet.String())
 	return nil
 }
