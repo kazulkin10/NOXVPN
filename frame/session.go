@@ -1,5 +1,5 @@
 package frame
 
-// FrameControl — служебные кадры (аутентификация, настройки и т.п.).
-// Раньше его не было, сейчас используем для session-id.
-const FrameControl = 0x02
+// FrameControlLegacy is kept for compatibility with older code paths.
+// Use TypeControl instead.
+const FrameControlLegacy = TypeControl
