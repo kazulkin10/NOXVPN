@@ -1,131 +1,186 @@
 package server
 
 import (
-"errors"
-"net"
-"sync"
-"time"
+	"errors"
+	"fmt"
+	"net"
+	"sync"
+	"time"
 )
 
+// Lease describes one client assignment.
 type Lease struct {
-IP       net.IP
-LastSeen time.Time
+	IP       net.IP
+	MaskBits int
+	Session  string
+	LastSeen time.Time
 }
 
+// IPAlloc manages IP leases with session stickiness and GC.
 type IPAlloc struct {
-mu        sync.Mutex
-base      net.IP
-maskBits  int
-nextHost  int
-maxHost   int
-bySession map[[8]byte]Lease
-byIP      map[string][8]byte
+	mu        sync.Mutex
+	base      net.IP
+	baseInt   uint32
+	maskBits  int
+	firstHost int
+	lastHost  int
+	nextHost  int
+	bySession map[string]*Lease
+	byIP      map[string]string
 }
 
 func NewIPAlloc(cidr string) (*IPAlloc, error) {
-_, ipnet, err := net.ParseCIDR(cidr)
-if err != nil {
-return nil, err
-}
-ones, bits := ipnet.Mask.Size()
-if bits != 32 {
-return nil, errors.New("only IPv4 for now")
-}
-base := ipnet.IP.To4()
-if base == nil {
-return nil, errors.New("bad base ip")
-}
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, err
+	}
+	ones, bits := ipnet.Mask.Size()
+	if bits != 32 {
+		return nil, errors.New("only IPv4 for now")
+	}
+	base := ipnet.IP.To4()
+	if base == nil {
+		return nil, errors.New("bad base ip")
+	}
+	baseInt := ipToUint32(base)
 
-hosts := 1 << (32 - ones)
-if hosts < 4 {
-return nil, errors.New("subnet too small")
-}
+	hosts := 1 << (32 - ones)
+	if hosts < 4 {
+		return nil, errors.New("subnet too small")
+	}
 
-// reserved: .0 network, .1 server, .255 broadcast (roughly), start from .2
-return &IPAlloc{
-base:      base,
-maskBits: ones,
-nextHost: 2,
-maxHost:  hosts - 2,
-bySession: make(map[[8]byte]Lease),
-byIP:      make(map[string][8]byte),
-}, nil
+	// reserve .0 (network) и .1 (шлюз); оставляем broadcast нетронутым.
+	firstHost := 2
+	lastHost := hosts - 2
+	if lastHost < firstHost {
+		return nil, fmt.Errorf("subnet too small for leases: %d hosts", hosts)
+	}
+
+	return &IPAlloc{
+		base:      base,
+		baseInt:   baseInt,
+		maskBits:  ones,
+		firstHost: firstHost,
+		lastHost:  lastHost,
+		nextHost:  firstHost,
+		bySession: make(map[string]*Lease),
+		byIP:      make(map[string]string),
+	}, nil
 }
 
 func (a *IPAlloc) ipForHost(h int) net.IP {
-ip := make(net.IP, 4)
-copy(ip, a.base)
-ip[3] = byte(h)
-return ip
+	return uint32ToIP(a.baseInt + uint32(h))
 }
 
-func (a *IPAlloc) Acquire(session [8]byte) (net.IP, int, bool) {
-a.mu.Lock()
-defer a.mu.Unlock()
+// Acquire returns an IP for the session. If the session already had a lease,
+// it is reused. The bool indicates whether the lease is newly issued.
+func (a *IPAlloc) Acquire(session string) (Lease, bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-if l, ok := a.bySession[session]; ok {
-l.LastSeen = time.Now()
-a.bySession[session] = l
-return l.IP, a.maskBits, false
-}
+	if l, ok := a.bySession[session]; ok {
+		l.LastSeen = time.Now()
+		return *l, false, nil
+	}
 
-for h := a.nextHost; h <= a.maxHost; h++ {
-ip := a.ipForHost(h)
-key := ip.String()
-if _, used := a.byIP[key]; used {
-continue
-}
-a.bySession[session] = Lease{IP: ip, LastSeen: time.Now()}
-a.byIP[key] = session
-a.nextHost = h + 1
-return ip, a.maskBits, true
-}
+	// try linear scan from nextHost, then wrap around to firstHost
+	now := time.Now()
+	for pass := 0; pass < 2; pass++ {
+		start := a.firstHost
+		end := a.lastHost
+		if pass == 0 {
+			start = a.nextHost
+		} else {
+			end = a.nextHost - 1
+		}
+		for h := start; h <= end; h++ {
+			ip := a.ipForHost(h)
+			key := ip.String()
+			if _, used := a.byIP[key]; used {
+				continue
+			}
+			lease := &Lease{IP: ip, MaskBits: a.maskBits, Session: session, LastSeen: now}
+			a.bySession[session] = lease
+			a.byIP[key] = session
+			a.nextHost = h + 1
+			if a.nextHost > a.lastHost {
+				a.nextHost = a.firstHost
+			}
+			return *lease, true, nil
+		}
+	}
 
-// simple wrap-around scan
-for h := 2; h < a.nextHost; h++ {
-ip := a.ipForHost(h)
-key := ip.String()
-if _, used := a.byIP[key]; used {
-continue
-}
-a.bySession[session] = Lease{IP: ip, LastSeen: time.Now()}
-a.byIP[key] = session
-return ip, a.maskBits, true
-}
-
-return nil, 0, false
-}
-
-func (a *IPAlloc) Touch(session [8]byte) {
-a.mu.Lock()
-defer a.mu.Unlock()
-if l, ok := a.bySession[session]; ok {
-l.LastSeen = time.Now()
-a.bySession[session] = l
-}
+	return Lease{}, false, errors.New("no free ip")
 }
 
-func (a *IPAlloc) Release(session [8]byte) {
-a.mu.Lock()
-defer a.mu.Unlock()
-l, ok := a.bySession[session]
-if !ok {
-return
-}
-delete(a.bySession, session)
-delete(a.byIP, l.IP.String())
+// Touch marks the session as active; returns false if session not found.
+func (a *IPAlloc) Touch(session string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if l, ok := a.bySession[session]; ok {
+		l.LastSeen = time.Now()
+		return true
+	}
+	return false
 }
 
-func (a *IPAlloc) ReapIdle(ttl time.Duration) (killed int) {
-a.mu.Lock()
-defer a.mu.Unlock()
-now := time.Now()
-for sess, l := range a.bySession {
-if now.Sub(l.LastSeen) > ttl {
-delete(a.bySession, sess)
-delete(a.byIP, l.IP.String())
-killed++
+// Release frees the lease for the session.
+func (a *IPAlloc) Release(session string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	l, ok := a.bySession[session]
+	if !ok {
+		return
+	}
+	host := a.hostForIP(l.IP)
+	delete(a.bySession, session)
+	delete(a.byIP, l.IP.String())
+	if host >= a.firstHost && host <= a.lastHost && host < a.nextHost {
+		a.nextHost = host
+	}
 }
+
+// ReapIdle releases sessions idle longer than ttl and returns number removed.
+func (a *IPAlloc) ReapIdle(ttl time.Duration) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now()
+	killed := 0
+	for sess, l := range a.bySession {
+		if now.Sub(l.LastSeen) > ttl {
+			delete(a.bySession, sess)
+			delete(a.byIP, l.IP.String())
+			killed++
+		}
+	}
+	return killed
 }
-return
+
+// Stats returns counts useful for logging.
+func (a *IPAlloc) Stats() (total int, used int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	total = (a.lastHost - a.firstHost) + 1
+	used = len(a.bySession)
+	return total, used
+}
+
+func (a *IPAlloc) hostForIP(ip net.IP) int {
+	ipVal := ipToUint32(ip)
+	if ipVal < a.baseInt {
+		return -1
+	}
+	return int(ipVal - a.baseInt)
+}
+
+func ipToUint32(ip net.IP) uint32 {
+	v4 := ip.To4()
+	if v4 == nil {
+		return 0
+	}
+	return uint32(v4[0])<<24 | uint32(v4[1])<<16 | uint32(v4[2])<<8 | uint32(v4[3])
+}
+
+func uint32ToIP(v uint32) net.IP {
+	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
