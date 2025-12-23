@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -123,9 +125,15 @@ func runOnce(server, staticCIDR, tunName string, t *tun.Tun, ciph *noxcrypto.Cip
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	exec.Command("sh", "-c", "ip addr replace "+assigned+" dev "+tunName).Run()
-	exec.Command("sh", "-c", "ip link set "+tunName+" up").Run()
-	exec.Command("sh", "-c", "ip route replace 10.8.0.0/24 dev "+tunName).Run()
+	ipnet, err := netipFromCIDR(assigned)
+	if err != nil {
+		return err
+	}
+	route := &net.IPNet{IP: ipnet.IP.Mask(ipnet.Mask), Mask: ipnet.Mask}
+	if err := tun.Configure(tun.Config{Name: tunName, Address: ipnet, Route: route, MTU: tun.DefaultMTU}); err != nil {
+		return fmt.Errorf("configure tun: %w", err)
+	}
+	log.Printf("TUN %s configured addr=%s route=%s mtu=%d\n", tunName, ipnet.String(), route.String(), tun.DefaultMTU)
 
 	kaDone := make(chan struct{})
 	var kaOnce sync.Once
@@ -171,7 +179,11 @@ func runOnce(server, staticCIDR, tunName string, t *tun.Tun, ciph *noxcrypto.Cip
 			}
 			if fr.StreamID == streamData {
 				if _, err := t.WritePacket(pt); err != nil {
-					log.Println("tun write:", err)
+					if errors.Is(err, syscall.EIO) {
+						log.Println("tun write EIO, shutting down")
+					} else {
+						log.Println("tun write:", err)
+					}
 					closeKA()
 					return
 				}
@@ -179,10 +191,18 @@ func runOnce(server, staticCIDR, tunName string, t *tun.Tun, ciph *noxcrypto.Cip
 		}
 	}()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-kaDone
+		cancel()
+	}()
+
 	buf := make([]byte, 65535)
 	for {
 		select {
 		case <-kaDone:
+			return nil
+		case <-ctx.Done():
 			return nil
 		default:
 		}
@@ -193,8 +213,15 @@ func runOnce(server, staticCIDR, tunName string, t *tun.Tun, ciph *noxcrypto.Cip
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			if errors.Is(err, syscall.EIO) {
+				log.Println("tun read EIO, shutting down")
+				return nil
+			}
 			closeKA()
 			return err
+		}
+		if debugEnabled() {
+			log.Printf("TUN->NET %d bytes", n)
 		}
 		enc := ciph.Seal(buf[:n])
 		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -257,6 +284,21 @@ func loadSessionID() {
 	if _, err := rand.Read(sessionID[:]); err != nil {
 		log.Fatalf("session id gen: %v", err)
 	}
+}
+
+func netipFromCIDR(cidr string) (*net.IPNet, error) {
+	_, ipnet, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil {
+		return nil, fmt.Errorf("parse cidr: %w", err)
+	}
+	if ipnet.IP.To4() == nil {
+		return nil, fmt.Errorf("cidr must be IPv4: %s", cidr)
+	}
+	return ipnet, nil
+}
+
+func debugEnabled() bool {
+	return strings.TrimSpace(os.Getenv("DEBUG_TUN")) != ""
 }
 
 func getenvBool(k string, def bool) bool {

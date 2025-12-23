@@ -20,6 +20,7 @@ type Lease struct {
 type IPAlloc struct {
 	mu        sync.Mutex
 	base      net.IP
+	baseInt   uint32
 	maskBits  int
 	firstHost int
 	lastHost  int
@@ -41,6 +42,7 @@ func NewIPAlloc(cidr string) (*IPAlloc, error) {
 	if base == nil {
 		return nil, errors.New("bad base ip")
 	}
+	baseInt := ipToUint32(base)
 
 	hosts := 1 << (32 - ones)
 	if hosts < 4 {
@@ -56,6 +58,7 @@ func NewIPAlloc(cidr string) (*IPAlloc, error) {
 
 	return &IPAlloc{
 		base:      base,
+		baseInt:   baseInt,
 		maskBits:  ones,
 		firstHost: firstHost,
 		lastHost:  lastHost,
@@ -66,10 +69,7 @@ func NewIPAlloc(cidr string) (*IPAlloc, error) {
 }
 
 func (a *IPAlloc) ipForHost(h int) net.IP {
-	ip := make(net.IP, 4)
-	copy(ip, a.base)
-	ip[3] = byte(h)
-	return ip
+	return uint32ToIP(a.baseInt + uint32(h))
 }
 
 // Acquire returns an IP for the session. If the session already had a lease,
@@ -132,7 +132,7 @@ func (a *IPAlloc) Release(session string) {
 	if !ok {
 		return
 	}
-	host := int(l.IP[3])
+	host := a.hostForIP(l.IP)
 	delete(a.bySession, session)
 	delete(a.byIP, l.IP.String())
 	if host >= a.firstHost && host <= a.lastHost && host < a.nextHost {
@@ -163,4 +163,24 @@ func (a *IPAlloc) Stats() (total int, used int) {
 	total = (a.lastHost - a.firstHost) + 1
 	used = len(a.bySession)
 	return total, used
+}
+
+func (a *IPAlloc) hostForIP(ip net.IP) int {
+	ipVal := ipToUint32(ip)
+	if ipVal < a.baseInt {
+		return -1
+	}
+	return int(ipVal - a.baseInt)
+}
+
+func ipToUint32(ip net.IP) uint32 {
+	v4 := ip.To4()
+	if v4 == nil {
+		return 0
+	}
+	return uint32(v4[0])<<24 | uint32(v4[1])<<16 | uint32(v4[2])<<8 | uint32(v4[3])
+}
+
+func uint32ToIP(v uint32) net.IP {
+	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }

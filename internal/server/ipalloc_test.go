@@ -104,6 +104,41 @@ func TestIPAllocReleaseAndReacquireSameIP(t *testing.T) {
 	}
 }
 
+func TestIPAllocAllocatesAcrossOctets(t *testing.T) {
+	alloc, err := NewIPAlloc("10.8.0.0/23")
+	if err != nil {
+		t.Fatalf("new ipalloc: %v", err)
+	}
+
+	alloc.mu.Lock()
+	alloc.nextHost = 254
+	alloc.mu.Unlock()
+
+	lease1, fresh, err := alloc.Acquire("sess-a")
+	if err != nil || !fresh {
+		t.Fatalf("first acquire: fresh=%v err=%v", fresh, err)
+	}
+	if got := lease1.IP.String(); got != "10.8.0.254" {
+		t.Fatalf("expected 10.8.0.254, got %s", got)
+	}
+
+	lease2, fresh, err := alloc.Acquire("sess-b")
+	if err != nil || !fresh {
+		t.Fatalf("second acquire: fresh=%v err=%v", fresh, err)
+	}
+	if got := lease2.IP.String(); got != "10.8.0.255" {
+		t.Fatalf("expected 10.8.0.255, got %s", got)
+	}
+
+	lease3, fresh, err := alloc.Acquire("sess-c")
+	if err != nil || !fresh {
+		t.Fatalf("third acquire: fresh=%v err=%v", fresh, err)
+	}
+	if got := lease3.IP.String(); got != "10.8.1.0" {
+		t.Fatalf("expected 10.8.1.0 after crossing boundary, got %s", got)
+	}
+}
+
 func TestIPAllocSameSessionReconnectDoesNotGrowPool(t *testing.T) {
 	alloc, err := NewIPAlloc("10.8.0.0/29")
 	if err != nil {

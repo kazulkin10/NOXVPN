@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -11,9 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/vishvananda/netlink"
 	"golang.org/x/crypto/chacha20poly1305"
 
 	"nox-core/internal/server"
@@ -27,6 +29,7 @@ const (
 	streamData  uint32 = 100
 	defaultCIDR        = "10.8.0.0/24"
 	leaseTTL           = 10 * time.Minute
+	defaultMTU         = tun.DefaultMTU
 )
 
 const (
@@ -58,7 +61,7 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Println("TUN nox0 created")
-	if err := configureServerTUN("nox0", cidr); err != nil {
+	if err := setupServerTUN("nox0", cidr); err != nil {
 		log.Fatalf("tun setup failed: %v", err)
 	}
 
@@ -200,6 +203,12 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 		}
 	}()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-kaDone
+		cancel()
+	}()
+
 	go func() {
 		for {
 			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
@@ -233,7 +242,11 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 
 			if fr.StreamID == streamData {
 				if _, err := t.WritePacket(pt); err != nil {
-					log.Println("tun write:", err)
+					if errors.Is(err, syscall.EIO) {
+						log.Println("tun write EIO, shutting down")
+					} else {
+						log.Println("tun write:", err)
+					}
 					closeKA()
 					return
 				}
@@ -246,6 +259,8 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 		select {
 		case <-kaDone:
 			return
+		case <-ctx.Done():
+			return
 		default:
 		}
 
@@ -255,8 +270,15 @@ func handle(conn net.Conn, t *tun.Tun, ciph *noxcrypto.Cipher, allocator *ipam.I
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			if errors.Is(err, syscall.EIO) {
+				log.Println("tun read EIO, shutting down")
+				return
+			}
 			log.Println("tun read:", err)
 			return
+		}
+		if debugEnabled() {
+			log.Printf("TUN->NET %d bytes", n)
 		}
 		enc := ciph.Seal(buf[:n])
 
@@ -317,69 +339,32 @@ func loadKey() ([]byte, error) {
 	return k, nil
 }
 
-func configureServerTUN(name, cidr string) error {
-	link, err := netlink.LinkByName(name)
-	if err != nil {
-		return fmt.Errorf("lookup link %s: %w", name, err)
-	}
+func setupServerTUN(name, cidr string) error {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return err
 	}
-	_, bits := ipnet.Mask.Size()
-	if bits != 32 {
-		return fmt.Errorf("only IPv4 cidr supported")
-	}
 	base := ipnet.IP.To4()
 	if base == nil {
-		return fmt.Errorf("bad base ip")
+		return fmt.Errorf("invalid ipv4 base for %s", cidr)
 	}
 	gw := make(net.IP, len(base))
 	copy(gw, base)
 	gw[3]++
 	gwNet := &net.IPNet{IP: gw, Mask: ipnet.Mask}
 
-	addr := &netlink.Addr{IPNet: gwNet}
-	if err := netlink.AddrReplace(link, addr); err != nil {
-		return fmt.Errorf("addr replace %s: %w", gwNet.String(), err)
+	if err := tun.Configure(tun.Config{Name: name, Address: gwNet, Route: ipnet, MTU: defaultMTU}); err != nil {
+		return err
 	}
-	route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: ipnet}
-	if err := netlink.RouteReplace(route); err != nil {
-		return fmt.Errorf("route replace %s: %w", ipnet.String(), err)
-	}
-	if err := netlink.LinkSetUp(link); err != nil {
-		return fmt.Errorf("link set up: %w", err)
-	}
-
-	// verify state and address
-	fresh, err := netlink.LinkByName(name)
-	if err != nil {
-		return fmt.Errorf("relookup %s: %w", name, err)
-	}
-	attrs := fresh.Attrs()
-	if attrs == nil || attrs.Flags&net.FlagUp == 0 {
-		return fmt.Errorf("tun %s is not UP after setup", name)
-	}
-	addrs, err := netlink.AddrList(fresh, netlink.FAMILY_ALL)
-	if err != nil {
-		return fmt.Errorf("addr list: %w", err)
-	}
-	found := false
-	for _, a := range addrs {
-		if a.IPNet != nil && a.IPNet.IP.Equal(gw) && a.IPNet.Mask.String() == gwNet.Mask.String() {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("tun %s missing addr %s", name, gwNet.String())
-	}
-
-	log.Printf("tun %s up addr=%s route=%s\n", name, gwNet.String(), ipnet.String())
+	log.Printf("tun %s up addr=%s route=%s mtu=%d\n", name, gwNet.String(), ipnet.String(), defaultMTU)
 	return nil
 }
 
 func cleanupTUN(name string) {
 	_ = exec.Command("ip", "link", "del", name).Run()
 	_ = exec.Command("ip", "tuntap", "del", "dev", name, "mode", "tun").Run()
+}
+
+func debugEnabled() bool {
+	return strings.TrimSpace(os.Getenv("DEBUG_TUN")) != ""
 }
